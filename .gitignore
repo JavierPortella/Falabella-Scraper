@@ -1,6 +1,10 @@
-# Dataset Files
-*.csv
+# Critical Data
+/Data
+/Error
+/Reportes
+/Log
 *.xlsx
+*.csv
 
 # Jupyter Notebook
 .ipynb_checkpoints
