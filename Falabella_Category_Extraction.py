@@ -1,5 +1,6 @@
-from json import loads
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timedelta
+from json import JSONDecodeError
 from logging import (
     basicConfig,
     ERROR,
@@ -10,19 +11,60 @@ from logging import (
     StreamHandler,
 )
 from os import environ, makedirs, path
-from re import sub
+from re import search, sub
 from time import localtime, strftime, time
 from traceback import TracebackException
 
 from openpyxl import load_workbook, Workbook
 from pandas import DataFrame, read_csv
+from requests import get
 from selenium.common.exceptions import TimeoutException, ElementNotInteractableException
-from selenium.webdriver import Chrome, ChromeOptions
+from seleniumwire.webdriver import Chrome, ChromeOptions
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.remote_connection import LOGGER as seleniumLogger
 from selenium.webdriver.support.wait import WebDriverWait
 from urllib3.connectionpool import log as urllibLogger
+from urllib.parse import quote_plus
 from webdriver_manager.chrome import ChromeDriverManager
+
+CURRENT_DATE = datetime.now().date()
+URL_FALABELLA = "https://www.falabella.com.pe/falabella-pe"
+DATA_FILENAME = "falabella_category"
+DATA_FOLDER = "Data"
+ERROR_FILENAME = "falabella_error"
+ERROR_FOLDER = "Error"
+TIME_FILENAME = "Tiempos.xlsx"
+TIME_SHEET_NAME = "Categorias"
+# Diccionario de las categorías
+DATA_DICT_FILENAME = "category_dictionary.csv"
+DATA_DICT_HEADERS = ["Link_subcat", "Name", "Link_cat"]
+
+# Variables para manejar la api
+API_HEADERS = {
+    "accept": "*/*",
+    "accept-language": "es,es-ES;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+    "content-type": "application/json",
+    "sec-ch-ua": '"Chromium";v="110", "Not A(Brand";v="24", "Microsoft Edge";v="110"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-site",
+    "x-device-type": "desktop",
+    "Referer": "https://www.falabella.com.pe/",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+}
+API_URL = "https://www.falabella.com.pe/s/browse/v1/listing/pe"
+API_PARAMS = {
+    "page": "1",
+    "categoryId": None,
+    "categoryName": None,
+    "pgid": "2",
+    "pid": "799c102f-9b4c-44be-a421-23e366a63b82",
+    "zones": "912_LIMA_2,OLVAA_81,LIMA_URB1_DIRECTO,URBANO_83,IBIS_19,912_LIMA_1,150101,PERF_TEST,150000",
+}
+WHOLE_LINKS = []
 
 
 class Tiempo:
@@ -39,14 +81,10 @@ class Tiempo:
         num_errors (int): Cantidad de errores ocurridos durante la ejecución del scraper
     """
 
-    def __init__(self, current_date):
-        """Genera todos los atributos para una instancia de la clase Tiempo
-
-        Args:
-            current_date (datetime.date): Fecha en la que se ejecuta el scraper
-        """
+    def __init__(self):
+        """Genera todos los atributos para una instancia de la clase Tiempo"""
         self._start_time = time()
-        self._execution_date = current_date.strftime("%d/%m/%Y")
+        self._execution_date = CURRENT_DATE.strftime("%d/%m/%Y")
         self._start_hour = strftime("%H:%M:%S", localtime(self._start_time))
         self._end_hour = None
         self._quantity = 0
@@ -79,7 +117,7 @@ class Tiempo:
         self._quantity = quantity
 
     def set_param_final(self):
-        """Registra los parámetros finales para medir el tiempo de ejecución del scraper"""
+        """Registra los parámetros finales de la medición del tiempo de ejecución del scraper"""
         end = time()
         self._end_hour = strftime("%H:%M:%S", localtime(end))
         total = end - self._start_time
@@ -144,7 +182,7 @@ class Dataset:
         """Genera todos los atributos para una instancia de la clase Dataset
 
         Args:
-            data (pandas.core.frame.DataFrame): Contiene la información de las categorías
+            data (pandas.core.frame.DataFrame or dict): Contiene la información de las categorías
         """
         if isinstance(data, DataFrame):
             self._dataset = data
@@ -166,6 +204,14 @@ class Dataset:
             encoding (str, optional): Codificación usada para leer el archivo csv. Defaults to "utf-8-sig".
         """
         return cls(read_csv(filename, names=names, encoding=encoding))
+
+    def drop_rows(self, index):
+        """Función que elimina las filas de un dataset dado una lista de sus índices
+
+        Args:
+            index (list): Lista de índices de las filas a eliminar
+        """
+        self._dataset.drop(index, inplace=True)
 
     def filter_duplicate_values(self, column_filters):
         """Elimina todos los registros con valores duplicados excepto la primera aparición del mismo
@@ -189,19 +235,11 @@ class Dataset:
         """
         return self._dataset[self._dataset[column_name] == value].values.tolist()
 
-    def get_column_names(self):
-        """Retorna una lista con los nombres de las columnas existentes en el dataset
-
-        Returns:
-            list: Lista de nombres de las columnas
-        """
-        return self._dataset.columns.tolist()
-
     def get_column_values(self, column_name):
-        """Retorna una lista de valores de una columna existente en el dataset
+        """Retorna una lista de valores de una o varias columna(s) existente(s) en el dataset
 
         Args:
-            column_name (str): Nombre de la columna
+            column_name (str or list): Nombre o lista de nombres de la(s) columna(s)
 
         Returns
             list: Lista de valores
@@ -250,6 +288,14 @@ class Dataset:
             filename, header=header, index=False, mode=mode, encoding=encoding
         )
 
+    def sort_values(self, column_name):
+        """Ordena los regitros del dataset con respecto a los valores de una columna
+
+        Args:
+            column_name (str): Nombre de la columna usada como criterio de ordenamiento
+        """
+        self._dataset.sort_values(column_name, inplace=True)
+
 
 class ScraperFalabellaCategory:
     """Representa a un bot para hacer web scraping en saga falabella
@@ -264,34 +310,57 @@ class ScraperFalabellaCategory:
         wait (WebDriverWait): Objeto de la clase WebDriverWait que maneja el Tiempo de espera durante la ejecución del scraper
     """
 
-    def __init__(self, current_date, dict_filename):
+    def __init__(self, dict_filename):
         """Genera todos los atributos para una instancia de la clase ScraperFb
 
         Args:
-            current_date (datetime.date): Fecha en la que se ejecuta el scraper
             dict_filename (str): Nombre del archivo que va a ser usado como diccionario de datos
         """
         log(INFO, "Inicializando scraper")
-        self._time = Tiempo(current_date)
+        # Instanciar un objeto de clase Tiempo
+        self._time = Tiempo()
+        # Instanciar un objeto de clase Errores
         self._errors = Errores()
+        # Inicializar el atributo de clase como null
         self._df_category = None
+        # Comprobando si el diccionario para las categorías ya ha sido creado
         if path.isfile(dict_filename):
+            # Leer el archivo
             self._df_dict_category = Dataset.from_csv(
-                dict_filename, names=["Link_subcat", "Name", "Link_cat"]
+                dict_filename, names=DATA_DICT_HEADERS
             )
+            # Ordenar los valores
+            self._df_dict_category.sort_values(DATA_DICT_HEADERS[0])
             log(
                 INFO,
                 "El archivo de diccionario de categorías se ha definido satisfactoriamente",
             )
         else:
+            # Inicializar el atributo de clase como null
             self._df_dict_category = None
-            log(INFO, "El archivo de diccionario de categorías no se ha definido")
-
+            log(
+                INFO,
+                "El archivo de diccionario de categorías no se va a utilizar por ser la primera ejecución",
+            )
+        # Guardar el nombre del archivo en un atributo de clase
         self._df_dict_category_filename = dict_filename
-        options = ChromeOptions()
-        prefs = {"profile.default_content_setting_values.notifications": 2}
-        options.add_experimental_option("prefs", prefs)
-        self._driver = Chrome(ChromeDriverManager().install(), options=options)
+        # Generando una variable que maneje las opciones de Chrome
+        chrome_options = ChromeOptions()
+        # Estableciendo las opciones de Chrome
+        prefs = {
+            "profile.default_content_setting_values.notifications": 2,
+            "profile.managed_default_content_settings.popups": 2,
+        }
+        # Estableciendo las opciones de seleniumwire
+        seleniumwire_options = {"disable_capture": True}  # No guardar ningún request
+        chrome_options.add_experimental_option("prefs", prefs)
+        # Generando el webdriver que va a manejar el navegador de Chrome
+        self._driver = Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=chrome_options,
+            seleniumwire_options=seleniumwire_options,
+        )
+        # Generando el tiempo de espera para la localización de los elementos web
         self._wait = WebDriverWait(self._driver, 8)
 
     def enter_website(self, url):
@@ -335,19 +404,45 @@ class ScraperFalabellaCategory:
         """Cierra todas las ventanas emergentes"""
         log(INFO, "Cerrando ventanas emergentes")
         self._driver.delete_all_cookies()
+        self.get_element(By.CLASS_NAME, "dy-lb-close").click()
         self.get_element(By.ID, "testId-accept-cookies-btn").click()
-        # self.get_element(By.CLASS_NAME, "dy-lb-close").click()
+        # self.get_element(By.CLASS_NAME, "airship-btn airship-btn-deny").click()
 
     def is_url_category(self, url):
-        """Comprueba si el link pertenece a una categoría de saga falabella
+        """Comprueba si el link no pertenece a una categoría de falabella
 
         Args:
-            url (_type_): Enlace web
+            url (str): Enlace web
 
         Returns:
-            bool: Booleano que indica si el link pertenece o no a una categoría de saga falabella
+            bool: Booleano que indica si el link pertenece o no a una categoría de falabella
         """
         return url.find("category") != -1
+
+    def is_permanent_category(self, text):
+        """Comprueba si la categoría mostrada por el menú es creada solo por temporadas o es permanente
+
+        Args:
+            text (str): Nombre de la categoría
+
+        Returns:
+            bool: Booleano
+        """
+        return text.find("NUEVO") == -1 and text.find("Emprendedores") == -1
+
+    def extract_text(self, pattern, text, n=1):
+        """Extrae el texto deseado de una cadena dado una expresión regular
+
+        Args:
+            pattern (str): Expresión regular a utilizar para la búsqueda
+            text (str): Texto donde se va a realizar la búsqueda
+            n (int, optional): Número de grupo a recuperar. Defaults to 1.
+
+        Returns:
+            str or None: Texto encontrado o vacío
+        """
+        groups = search(pattern, text)
+        return groups.group(n) if groups else groups
 
     def get_category_info(self):
         """Retorna un conjunto de datos que contiene toda la información de las categorías de saga falabella
@@ -355,24 +450,35 @@ class ScraperFalabellaCategory:
         Returns:
             Dataset: Instancia de la clase Dataset
         """
-        log(INFO, "Obteniendo información de las categorías principales")
-        # Accediendo al menú principal de saga falabella
-        self.get_element(By.CLASS_NAME, "TopMenu-module_categoryWrapper__Q_tEE").click()
-
-        # Registrando la lista de subcategorías que nos muestra el menú princial de saga falabella
-        category_list = self.get_elements(
-            By.XPATH, "//a[@class='SideMenu-module_itemWrapper__3IXOl']"
-        )
         # Lista que contiene los links de las subcategorías de saga falabella
         subcategory_links = []
-
         # Diccionario de datos que almacena la información de las categorías de saga falabella
-        category_info = {}
-
+        category_info_link = {}
         # Diccionario de datos que almacena las categorías de los links recorridos
-        category_dict_info = {"Link_subcat": [], "Name": [], "Link_cat": []}
+        category_dict_info = {
+            "Link_subcat": [],
+            "Name": [],
+            "Link_cat": [],
+        }
 
-        log(INFO, f"Navegando por el menú principal de saga falabella")
+        log(INFO, "Obteniendo información de las categorías principales")
+        # Accediendo al menú principal de saga falabella
+        self.get_element(
+            By.CLASS_NAME, "MarketplaceHamburgerBtn-module_hamburgerBtn__61t-r"
+        ).click()
+        # Registrando la lista de subcategorías que nos muestra el menú princial de saga falabella
+        category_list = self.get_elements(
+            By.XPATH, "//div[@class='FirstLevelCategories-module_categories__x82VK']"
+        )
+
+        log(INFO, "Filtrando categorías que son creadas temporalmente")
+        category_list = [
+            category
+            for category in category_list
+            if self.is_permanent_category(category.text)
+        ]
+
+        log(INFO, "Navegando por el menú principal de saga falabella")
         for category in category_list:
             try:
                 # Dando click a una categoría mostrada por el menú principal
@@ -381,23 +487,19 @@ class ScraperFalabellaCategory:
                 # Extrayendo los links de las subcategorías de la categoría actualmente seleccionada
                 subcategory_list = self.get_elements(
                     By.XPATH,
-                    "//a[@class='SubCategories-module_hover-effect__1E3TD SubCategories-module_list-item__6XLMU']",
+                    "//li[@class='SecondLevelCategories-module_thirdLevelCategory__2ZQFF']/a",
                 )
-
-                # Recorriendo la lista de subcategorías de la categoría actualmente seleccionada
-                for subcategory in subcategory_list:
-                    # Recuperando el link de la subcategoría sin parámetros adicionales
-                    url_subcat = sub(r"\?.+", "", subcategory.get_attribute("href"))
-
-                    # Comprobando que el link de la subcategoría contenga category
-                    if self.is_url_category(url_subcat):
-                        # Guardando el link de la subcategoría en una lista
-                        subcategory_links.append(url_subcat)
-                    else:
-                        log(
-                            INFO,
-                            f"El link {url_subcat} no corresponde a una categoría de saga falabella",
-                        )
+                # # Recuperando los links de las subcategorías sin parámetros adicionales
+                url_subcats = [
+                    sub(r"\?.+", "", subcategory.get_attribute("href"))
+                    for subcategory in subcategory_list
+                ]
+                # Filtrando y guardando los links que pertenecen a una categoría
+                subcategory_links += [
+                    url_subcat
+                    for url_subcat in url_subcats
+                    if self.is_url_category(url_subcat)
+                ]
 
             except TimeoutException as error:
                 log(
@@ -408,42 +510,39 @@ class ScraperFalabellaCategory:
 
         # Filtrando links duplicados
         subcategory_links = list(set(subcategory_links))
-        subcategory_links.sort()
 
         log(INFO, "Cerrando ventana emergente molesta")
         self.enter_website(
-            "https://tienda.falabella.com.pe/falabella-pe/category/cat4100481/Moda-Hombre"
+            "https://www.falabella.com.pe/falabella-pe/category/cat780530/Refrigerador"
         )
         self.get_element(By.ID, "testId-modal-close").click()
-
         log(
             INFO,
             "Recopilando los links de las categorías principales a partir de los links de las subcategorías",
         )
         # Comprobando si el diccionario de links recorridos ha sido definido
         if self._df_dict_category:
+            log(
+                INFO,
+                "Usando el diccionario de datos para encontrar las categorías principales",
+            )
             temp_subcat_links = []
             # Recorriendo los links de cada subcategoría
             for link in subcategory_links:
                 # Buscando si el link a recorrer ya existe en el diccionario de links
-                results = self._df_dict_category.find_rows(
-                    self._df_dict_category.get_column_names()[0], link
-                )
+                results = self._df_dict_category.find_rows(DATA_DICT_HEADERS[0], link)
                 # Comprobando que existan resultados
                 if len(results) > 0:
                     # Extrayendo la primera coincidencia
                     _, name, url_cat = results[0]
                     # Guardando el nombre y link de la categoría principal
-                    category_info[name] = url_cat
-                    log(
-                        INFO,
-                        "Se ha conseguido encontrado en el diccionario la categoría principal",
-                    )
-                    log(INFO, f"Categoría Obtenida: {name}")
+                    category_info_link[name] = url_cat
                 else:
                     # Guardar los links que aún faltan recorrer
                     temp_subcat_links.append(link)
+
             subcategory_links = temp_subcat_links
+            del temp_subcat_links
 
         log(INFO, f"Se va a recorrer solo {len(subcategory_links)} links")
         # Recorriendo la lista con los links que aún faltan por recorrer
@@ -456,10 +555,9 @@ class ScraperFalabellaCategory:
             # Comprobando que el link no te rediriga a otra página
             current_link = self._driver.execute_script("return document.URL")
             if not self.is_url_category(current_link):
-                log(INFO, f"No se va a extraer categorías del link {link}")
                 log(
                     INFO,
-                    f"Razón: El link {link} te redirige a otro link: {current_link}",
+                    f"No se va a extraer categorías del link {link}, pues te redirige a otro link: {current_link}",
                 )
                 continue
 
@@ -479,36 +577,27 @@ class ScraperFalabellaCategory:
                     no_error = False
 
             url_cat = self._driver.execute_script("return document.URL")
-
             # Obteniendo el nombre de la categoría principal
-            name = self.get_element(
+            name_cat = self.get_element(
                 By.XPATH, "//h1[@class='jsx-2883309125 l2category']"
             ).text
-
-            # Guardando las nuevas incidencias
+            log(INFO, f"Categoría Obtenida: {name_cat}")
+            # Guardando las nuevas incidencias al diccionario de categorías
             category_dict_info["Link_subcat"].append(link)
-            category_dict_info["Name"].append(name)
+            category_dict_info["Name"].append(name_cat)
             category_dict_info["Link_cat"].append(url_cat)
-
-            # Comprobando que la categoría no tenga como nombre Especiales
-            if name == "Especiales":
-                log(
-                    INFO,
-                    f"La categoría {name} no se va a guardar por ser una categoría que engloba a otras categorías",
-                )
-                continue
-
-            log(INFO, f"Categoría Obtenida: {name}")
-            # Guardando el nombre y link de la categoría principal
-            category_info[name] = url_cat
+            # Guardando el nombre, link, id de la categoría principal
+            category_info_link[name_cat] = url_cat
 
         df_dict_info = Dataset(category_dict_info)
+        # Comprobando si existen nuevas incidencias
         if df_dict_info.length() == 0:
             log(
                 INFO,
                 "No se va a guardar el diccionario de links recorridos. Razón: No han aparecido nuevas incidencias",
             )
         else:
+            # Agregar las nuevas incidencias a las ya existentes
             df_dict_info.save_dataset(
                 self._df_dict_category_filename, header=False, mode="a"
             )
@@ -517,50 +606,76 @@ class ScraperFalabellaCategory:
                 f"Diccionarios de datos guardados satisfactoriamente con el nombre de {self._df_dict_category_filename}",
             )
 
+        # Filtrando la categoría Especiales
+        category_info_link = {
+            key: category_info_link[key]
+            for key in category_info_link
+            if key != "Especiales"
+        }
+        cat_info_values = category_info_link.values()
         log(INFO, "Categorías principales recuperadas satisfactoriamente\n")
-        return Dataset({"Name": category_info.keys(), "Link_0": category_info.values()})
+        return Dataset(
+            {
+                "Id_0": [self.extract_text(r"/.*/(.*)/", x) for x in cat_info_values],
+                "Name_0": category_info_link.keys(),
+                "Link_0": cat_info_values,
+            }
+        )
 
-    def get_subcategory_info(self, category_links):
+    def get_subcategory_info(self, column_values):
         """Retorna un conjunto de datos que contiene toda la información de las subcategorías de saga falabella
 
         Args:
-            category_links (list): Lista de links de las categorías de saga falabella
+            column_values (list): Lista de valores a ser usados para la extracción de subcategorías
 
         Returns:
             Dataset: Instancia de la clase Dataset
         """
         subcategory_info = {
-            "Link": [],
+            "Id": [],
+            "Id_subcat": [],
             "Subcategory": [],
-            "Link_1": [],
+            "Link_subcat": [],
         }
-        for category_level in category_links:
+        for category_level in column_values:
             try:
-                self.enter_website(category_level)
-                data = self.get_element(By.XPATH, "//script[@id='__NEXT_DATA__']")
-                data_json = loads(data.get_attribute("text"))
-                filters_value = data_json["props"]["pageProps"]["facets"][:3]
-                for filter_value in filters_value:
+                API_PARAMS["categoryId"] = category_level[0]
+                API_PARAMS["categoryName"] = quote_plus(category_level[1])
+                response = get(API_URL, headers=API_HEADERS, params=API_PARAMS)
+                filters_value = response.json()["data"]["facets"][:3]
+                for filter_value in filters_value[::-1]:
                     if filter_value["name"] == "Categoría":
                         data_values = filter_value["values"]
                         for item in data_values:
                             title = item["title"]
-                            subcategory_info["Link_1"].append(
-                                "https://tienda.falabella.com.pe/falabella-pe/category/"
-                                + item["id"]
+                            id_cat = item["id"]
+                            subcategory_info["Link_subcat"].append(
+                                "https://www.falabella.com.pe/falabella-pe/category/"
+                                + id_cat
                                 + "/"
                                 + title.replace(" ", "-")
                             )
-                            subcategory_info["Link"].append(category_level)
+                            subcategory_info["Id"].append(category_level[0])
                             subcategory_info["Subcategory"].append(title)
+                            subcategory_info["Id_subcat"].append(id_cat)
                         break
+                WHOLE_LINKS += subcategory_info["Id"]
+                index_values = [
+                    id_index
+                    for id_index, id_subcat in enumerate(subcategory_info["Id_subcat"])
+                    if id_subcat in WHOLE_LINKS
+                ]
+                df_subcat_info = Dataset(subcategory_info)
+                if len(index_values) > 0:
+                    df_subcat_info.drop_rows(index_values)
 
-            except (IndexError, KeyError, TimeoutException) as error:
-                log(ERROR, f"Error: {error}\nEnlace: {category_level}")
+            except (IndexError, JSONDecodeError, KeyError) as error:
+                log(ERROR, f"Error: {error}")
                 self._errors.add_new_error(
                     error, "Extracción categorías secundarias", category_level
                 )
-        return Dataset(subcategory_info)
+
+        return df_subcat_info
 
     def extract_categories(self, level):
         """Extrae la información de las categorías de saga falabella hasta cierto nivel de profundidad
@@ -572,7 +687,7 @@ class ScraperFalabellaCategory:
             INFO,
             f"Extrayendo el árbol de categorías de saga falabella con profundidad {level}",
         )
-        if level < 0:
+        if level <= 0:
             log(
                 ERROR,
                 f"La cantidad de niveles de jerarquía de la clasificación de las categorías debe ser mayor o igual a 0",
@@ -590,32 +705,36 @@ class ScraperFalabellaCategory:
             return
 
         log(INFO, "Extrayendo información de las subcategorías")
-        for i in range(1, level + 1):
+        for i in range(1, level):
             log(INFO, f"Obteniendo información de las subcategorías de nivel {i}")
             # Definiendo la columna a ser usada como nexo para el merge
-            join_col = "Link_" + str(i - 1)
+            id_prev = "Id_" + str(i - 1)
+            name_prev = "Name_" + str(i - 1)
             df_subcategory = self.get_subcategory_info(
-                df_subcategory.get_column_values(join_col)
+                df_subcategory.get_column_values([id_prev, name_prev])
             )
 
             if df_subcategory.length() == 0:
                 level = i
                 log(
-                    INFO, f"Se ha llegado al máximo de profundidad con un valor de {i}."
+                    INFO,
+                    f"Se ha llegado al máximo de profundidad con un valor de {level}.",
                 )
                 break
 
             # Renombrando las columnas del dataset
             df_subcategory.rename_columns(
                 {
-                    "Link": join_col,
-                    "Subcategory": "Subcategory_" + str(i),
-                    "Link_1": "Link_" + str(i),
+                    "Id": id_prev,
+                    "Subcategory": "Name_" + str(i),
+                    "Link_subcat": "Link_" + str(i),
+                    "Id_subcat": "Id_" + str(i),
                 }
             )
+            df_subcategory.filter_duplicate_values(["Id_" + str(i)])
             # Combinando el dataset que contiene la información de las categorías y subcategorías
             self._df_category.merge_dataset(
-                df_subcategory.dataset, join_col, join_col, "left"
+                df_subcategory.dataset, id_prev, id_prev, "left"
             )
             log(INFO, f"Subcategorías de nivel {i} recuperadas satisfactoriamente\n")
         log(
@@ -684,7 +803,7 @@ class ScraperFalabellaCategory:
             # Creando la ruta donde se va a guardar la información
             makedirs(filepath)
 
-        # Guardando la información en un archivo de tipo excel
+        # Guardando la información en un archivo de tipo csv
         dataset.save_dataset(path.join(filepath, filename))
         log(
             INFO,
@@ -702,24 +821,23 @@ class ScraperFalabellaCategory:
         self._time.set_param_final()
         log(INFO, "Guardando tiempos")
         # Variable que indica si el encabezados existe o no en el archivo de excel
-        header_exist = True
+        header_exist = False
 
         # Verificando si el archivo existe o no
         if path.isfile(filename):
             # Leendo el archivo
             wb_time = load_workbook(filename)
+            # Comprobando si ya existe un sheet con el nombre indicado en la variable sheet_name
+            if sheet_name not in [ws.title for ws in wb_time.worksheets]:
+                # Creando un nuevo sheet
+                wb_time.create_sheet(sheet_name)
+            else:
+                # Especificar que ya existen encabezados en el nuevo sheet
+                header_exist = True
         else:
             # Creando un archivo de tipo workbook
             wb_time = Workbook()
             wb_time.worksheets[0].title = sheet_name
-            header_exist = False
-
-        # Comprobando si ya existe un sheet con el nombre indicado en la variable sheet_name
-        if sheet_name not in [ws.title for ws in wb_time.worksheets]:
-            # Creando un nuevo sheet
-            wb_time.create_sheet(sheet_name)
-            # Especificar que no existen encabezados en el nuevo sheet
-            header_exist = False
 
         # Seleccionar el sheet deseado donde se va a guardar la información
         worksheet = wb_time[sheet_name]
@@ -750,17 +868,14 @@ class ScraperFalabellaCategory:
         log(INFO, "Tiempos Guardados Correctamente")
 
 
-def config_log(
-    log_folder, log_filename, log_file_mode, log_file_encoding, current_date
-):
+def config_log(log_folder, log_filename, log_file_mode="w", log_file_encoding="utf-8"):
     """Función que configura los logs para rastrear al programa
 
     Args:
         log_folder (str): Carpeta donde se va a generar el archivo log
         log_filename (str): Nombre del archivo log a ser generado
-        log_file_mode (str): Modo de guardado del archivo
-        log_file_encoding (str): Codificación usada para el archivo
-        current_date (datetime): Fecha actual de la creación del archivo log
+        log_file_mode (str, optional): Modo de guardado del archivo. Defaults to "w".
+        log_file_encoding (str, optional): Codificación usada para el archivo. Defaults to "utf-8".
     """
     # Mostrar solo los errores de los registros que maneja selenium
     seleniumLogger.setLevel(ERROR)
@@ -768,9 +883,10 @@ def config_log(
     # Mostrar solo los errores de los registros que maneja urllib
     urllibLogger.setLevel(ERROR)
     # Generando la ruta donde se va a guardar los registros de ejecución
-    log_path = path.join(log_folder, current_date.strftime("%d-%m-%Y"))
+    log_path = path.join(log_folder, CURRENT_DATE.strftime("%d-%m-%Y"))
     # Generando el nombre del archivo que va a contener los registros de ejecución
-    log_filename = log_filename + "_" + current_date.strftime("%d%m%Y") + ".log"
+    log_filename = log_filename + "_" + CURRENT_DATE.strftime("%d%m%Y") + ".log"
+
     # Verificando si la ruta donde se va a guardar los registros de ejecución existe
     if not path.exists(log_path):
         # Creando la ruta donde se va a guardar los registros de ejecución
@@ -810,72 +926,60 @@ def validate_params(parameters):
 
 
 def main():
-    # Formato para el debugger
-    current_date = datetime.now().date()
-    config_log("Log", "fb_ropa_log", "w", "utf-8", current_date)
-    log(INFO, "Configurando Formato Básico del Debugger")
+    try:
+        # Formato para el debugger
+        config_log("Log", "fb_ropa_log")
+        log(INFO, "Configurando Formato Básico del Debugger")
 
-    # Url de la tienda de saga falabella
-    URL = "https://tienda.falabella.com.pe/falabella-pe"
+        log(INFO, "Validando parámetros a usar")
+        if not validate_params(
+            [
+                DATA_FILENAME,
+                DATA_FOLDER,
+                DATA_DICT_FILENAME,
+                ERROR_FILENAME,
+                ERROR_FOLDER,
+                TIME_FILENAME,
+                TIME_SHEET_NAME,
+                URL_FALABELLA,
+            ]
+        ):
+            log(ERROR, "Parámetros incorrectos")
+            return
+        log(INFO, "Parámetros válidos")
 
-    # Parámetros para guardar la data extraída por el scraper
-    DATA_FILENAME = "falabella_category"
-    DATA_FOLDER = "Data"
+        scraper = ScraperFalabellaCategory(DATA_DICT_FILENAME)
 
-    # Parámetros para guardar la data extraída por el scraper a ser usada como diccionario de datos
-    DATA_DICT_FILENAME = "example.csv"
+        # Entrando a la página web de la tienda de saga falabella
+        scraper.enter_website(URL_FALABELLA)
 
-    # Parámetros para guardar los errores durante la ejecución por el scraper
-    ERROR_FILENAME = "falabella_error"
-    ERROR_FOLDER = "Error"
+        # Maximizando la ventana del navegador
+        scraper.maximize_window()
 
-    # Parámetros para guardar la medición de la ejecución del scraper
-    TIME_FILENAME = "Tiempos.xlsx"
-    TIME_SHEET_NAME = "Categorias"
+        # Cerrar ventanas emergentes molestas
+        scraper.close_popups()
 
-    log(INFO, "Validando parámetros a usar")
-    if not validate_params(
-        [
-            DATA_FILENAME,
-            DATA_FOLDER,
-            DATA_DICT_FILENAME,
-            ERROR_FILENAME,
-            ERROR_FOLDER,
-            TIME_FILENAME,
-            TIME_SHEET_NAME,
-            URL,
-        ]
-    ):
-        log(ERROR, "Parámetros incorrectos")
-        return
-    log(INFO, "Parámetros válidos")
+        # Extraer las categorías
+        scraper.extract_categories(2)
 
-    scraper = ScraperFalabellaCategory(current_date, DATA_DICT_FILENAME)
+        # Guardando la data extraída por el scraper
+        scraper.save_data("Data", DATA_FOLDER, DATA_FILENAME)
 
-    # Entrando a la página web de la tienda de saga falabella
-    scraper.enter_website(URL)
+        # Guardando los errores extraídos por el scraper
+        scraper.save_data("Error", ERROR_FOLDER, ERROR_FILENAME)
 
-    # Maximizando la ventana del navegador
-    scraper.maximize_window()
+        # Guardando los tiempos durante la ejecución del scraper
+        scraper.save_time_execution(TIME_FILENAME, TIME_SHEET_NAME)
+        log(INFO, "Programa finalizado")
 
-    # Cerrar ventanas emergentes molestas
-    scraper.close_popups()
-
-    # Extraer las categorías
-    scraper.extract_categories(1)
-
-    # Guardando la data extraída por el scraper
-    scraper.save_data("Data", DATA_FOLDER, DATA_FILENAME)
-
-    # Guardando los errores extraídos por el scraper
-    scraper.save_data("Error", ERROR_FOLDER, ERROR_FILENAME)
-
-    # Guardando los tiempos durante la ejecución del scraper
-    scraper.save_time_execution(TIME_FILENAME, TIME_SHEET_NAME)
-    log(INFO, "Programa finalizado")
-
-    # Liberar el archivo log
-    shutdown()
+    except Exception as error:
+        log(INFO, "Ha ocurrido un error")
+        log(INFO, f"Error:\n{error}")
+        log(INFO, f"Error:\n{error.__class__.__name__}")
+        log(INFO, "Programa ejecutado con fallos")
+    finally:
+        # Liberar el archivo log
+        shutdown()
 
 
 if __name__ == "__main__":
